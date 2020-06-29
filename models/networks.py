@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch.nn import init
 import functools
 from torch.optim import lr_scheduler
+# from wav_pool import DWT, IWT
 
 
 ###############################################################################
@@ -10,6 +11,71 @@ from torch.optim import lr_scheduler
 ###############################################################################
 
 
+class DWT(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.requires_grad = False
+
+    def forward(self, x):
+
+        dim3 = x.shape[3]
+        dim2 = x.shape[2]
+
+        x01 = x[:, :, 0::2, :] / 2
+        x02 = x[:, :, 1::2, :] / 2
+
+        if (dim2 & 1) and (dim3 & 1):
+            x1  = x01[:, :, :-1, 0:-2:2]
+            x2  = x02[:, :, :  , 0:-2:2]
+            x3  = x01[:, :, :-1, 1:  :2]
+            x4  = x02[:, :, :  , 1:  :2]           
+        elif dim3 & 1:
+            x1  = x01[:, :, :, 0:-2:2]
+            x2  = x02[:, :, :, 0:-2:2]
+            x3  = x01[:, :, :, 1:  :2]
+            x4  = x02[:, :, :, 1:  :2]
+        elif dim2 & 1:
+            x1  = x01[:, :, :-1, 0::2]
+            x2  = x02[:, :, :  , 0::2]
+            x3  = x01[:, :, :-1, 1::2]
+            x4  = x02[:, :, :  , 1::2]
+        else:
+            x1  = x01[:, :, :, 0::2]
+            x2  = x02[:, :, :, 0::2]
+            x3  = x01[:, :, :, 1::2]
+            x4  = x02[:, :, :, 1::2]
+      
+        xll =   x1 + x2 + x3 + x4
+        xlh = - x1 + x2 - x3 + x4
+        xhl = - x1 - x2 + x3 + x4
+        xhh =   x1 - x2 - x3 + x4
+
+        return torch.cat((xll, xhl, xlh, xhh), 1)
+
+class IWT(nn.Module):
+    def __init__(self, cuda_flag=True):
+        super().__init__()
+        self.requires_grad = False
+        self.cuda_flag     = cuda_flag
+
+    def forward(self, x):
+        r = 2
+        in_batch, in_channel, in_height, in_width = x.size()
+        out_batch, out_channel, out_height, out_width = in_batch, int(in_channel / (r ** 2)), r * in_height, r * in_width
+        x1 = x[:, 0:out_channel, :, :] / 2
+        x2 = x[:, out_channel:out_channel * 2, :, :] / 2
+        x3 = x[:, out_channel * 2:out_channel * 3, :, :] / 2
+        x4 = x[:, out_channel * 3:out_channel * 4, :, :] / 2
+        
+        h = torch.zeros([out_batch, out_channel, out_height, out_width]).float()
+        if self.cuda_flag: h = h.cuda()
+
+        h[:, :, 0::2, 0::2] = x1 - x2 - x3 + x4
+        h[:, :, 1::2, 0::2] = x1 - x2 + x3 - x4
+        h[:, :, 0::2, 1::2] = x1 + x2 - x3 - x4
+        h[:, :, 1::2, 1::2] = x1 + x2 + x3 + x4
+
+        return h
 class Identity(nn.Module):
     def forward(self, x):
         return x
@@ -555,15 +621,20 @@ class NLayerDiscriminator(nn.Module):
 
         kw = 4
         padw = 1
-        sequence = [nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw), nn.LeakyReLU(0.2, True)]
+
+        # adjust this
+        pad1x1 = 1
+        
+        sequence = [nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=1, padding=padw), nn.LeakyReLU(0.2, True), DWT(), 
+                    nn.Conv2d(ndf*4, ndf, kernel_size=1, stride=1, padding=pad1x1), nn.LeakyReLU(0.2, True)]
         nf_mult = 1
         nf_mult_prev = 1
         for n in range(1, n_layers):  # gradually increase the number of filters
             nf_mult_prev = nf_mult
             nf_mult = min(2 ** n, 8)
             sequence += [
-                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=2, padding=padw, bias=use_bias),
-                norm_layer(ndf * nf_mult),
+                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=use_bias),
+                DWT(), nn.Conv2d(ndf*nf_mult*4, ndf * nf_mult, kernel_size=1, stride=1, padding=pad1x1), norm_layer(ndf * nf_mult),
                 nn.LeakyReLU(0.2, True)
             ]
 
@@ -580,7 +651,9 @@ class NLayerDiscriminator(nn.Module):
 
     def forward(self, input):
         """Standard forward."""
-        return self.model(input)
+        out = self.model(input)
+        # print('out shape:', out.shape)
+        return out
 
 
 class PixelDiscriminator(nn.Module):
